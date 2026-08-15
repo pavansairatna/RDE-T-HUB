@@ -1,0 +1,1 @@
+I'll build this as a real, working project — synthetic sentiment data, a small model exported to ONNX and quantized, and a lean Starlette server. Let me set it up and actually measure the latency rather than just claim numbers.
