@@ -1,1 +1,56 @@
+"""
+Raw ASGI gateway (Starlette, no pydantic overhead) exposing the vector
+index over HTTP.
 
+Run:
+    uvicorn vector_search.app:app --loop uvloop --http httptools --workers 4
+"""
+
+import time
+
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+from starlette.concurrency import run_in_threadpool
+
+from vector_search.config import INDEX_DIR, DEFAULT_TOP_K
+from vector_search.index import VectorIndex
+from vector_search.embedding import embed_query
+
+# Loaded once at process startup and kept warm — index open (mmap) and
+# embedding model load are both too expensive to redo per request.
+index = VectorIndex(INDEX_DIR)
+
+
+def _search(query: str, top_k: int) -> dict:
+    start = time.perf_counter()
+    query_vector = embed_query(query)
+    results = index.search(query_vector, top_k=top_k)
+    latency_ms = (time.perf_counter() - start) * 1000
+
+    return {
+        "results": [{"document": r.document, "score": r.score} for r in results],
+        "latency_ms": round(latency_ms, 3),
+    }
+
+
+async def search(request):
+    body = await request.json()
+    query = body.get("query")
+    top_k = int(body.get("top_k", DEFAULT_TOP_K))
+
+    if not query or not isinstance(query, str):
+        return JSONResponse({"error": "field 'query' (string) is required"}, status_code=400)
+
+    result = await run_in_threadpool(_search, query, top_k)
+    return JSONResponse(result)
+
+
+async def health(request):
+    return JSONResponse({"status": "ok", "num_vectors": index.size, "dim": index.dim})
+
+
+app = Starlette(routes=[
+    Route("/search", search, methods=["POST"]),
+    Route("/health", health, methods=["GET"]),
+])
