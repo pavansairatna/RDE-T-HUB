@@ -1,1 +1,96 @@
+import os
+import sys
+import time
+import numpy as np
+import onnxruntime as ort
+import orjson
+from starlette.applications import Starlette
+from starlette.responses import Response
+from starlette.routing import Route
+from starlette.requests import Request
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "model"))
+from featurize import hash_vectorize, hash_vectorize_batch, DIM
+
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "model", "sentiment_int8.onnx")
+LABELS = {0: "negative", 1: "positive"}
+
+# not using fastapi here bc pydantic validation is overkill for one text field,
+# just parsing json ourselves with orjson (faster than stdlib json anyway)
+
+so = ort.SessionOptions()
+so.intra_op_num_threads = 1
+so.inter_op_num_threads = 1
+so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+session = ort.InferenceSession(MODEL_PATH, sess_options=so, providers=["CPUExecutionProvider"])
+input_name = session.get_inputs()[0].name
+label_out = session.get_outputs()[0].name
+prob_out = session.get_outputs()[1].name
+
+# warm it up so the first real request isn't slow
+dummy = np.zeros((1, DIM), dtype=np.float32)
+for _ in range(20):
+    session.run(None, {input_name: dummy})
+
+
+def predict_one(text):
+    vec = hash_vectorize(text, DIM).reshape(1, -1)
+    t0 = time.perf_counter()
+    label, probs = session.run([label_out, prob_out], {input_name: vec})
+    ms = (time.perf_counter() - t0) * 1000
+    label = int(label[0])
+    score = float(probs[0][label])
+    return label, score, ms
+
+
+async def predict(request: Request):
+    try:
+        body = await request.body()
+        data = orjson.loads(body)
+    except Exception:
+        return Response(orjson.dumps({"error": "bad json"}), status_code=400)
+
+    text = data.get("text") if isinstance(data, dict) else None
+    if not text:
+        return Response(orjson.dumps({"error": "need a 'text' field"}), status_code=400)
+
+    label, score, ms = predict_one(text)
+    resp = {"label": LABELS[label], "score": round(score, 6), "infer_ms": round(ms, 4)}
+    return Response(orjson.dumps(resp), media_type="application/json")
+
+
+async def predict_batch(request: Request):
+    try:
+        body = await request.body()
+        data = orjson.loads(body)
+    except Exception:
+        return Response(orjson.dumps({"error": "bad json"}), status_code=400)
+
+    texts = data.get("texts") if isinstance(data, dict) else None
+    if not texts:
+        return Response(orjson.dumps({"error": "need a 'texts' list"}), status_code=400)
+
+    vecs = hash_vectorize_batch(texts, DIM)
+    t0 = time.perf_counter()
+    labels, probs = session.run([label_out, prob_out], {input_name: vecs})
+    ms = (time.perf_counter() - t0) * 1000
+
+    results = []
+    for i, lb in enumerate(labels):
+        lb = int(lb)
+        results.append({"label": LABELS[lb], "score": round(float(probs[i][lb]), 6)})
+
+    return Response(orjson.dumps({"results": results, "infer_ms": round(ms, 4)}), media_type="application/json")
+
+
+async def healthz(request: Request):
+    return Response(orjson.dumps({"status": "ok"}))
+
+
+app = Starlette(routes=[
+    Route("/predict", predict, methods=["POST"]),
+    Route("/predict/batch", predict_batch, methods=["POST"]),
+    Route("/healthz", healthz, methods=["GET"]),
+])
 
