@@ -1,0 +1,10 @@
+# mmap vs fully-loaded latency + memory
+uv run python benchmarks/benchmark_latency.py
+
+# HTTP load test (start the server first)
+uv run locust -f benchmarks/locustfile.py --host http://localhost:8000 \
+    --headless -u 50 -r 10 -t 30s
+
+# single-request timing
+hyperfine --warmup 3 \
+    'curl -s -X POST localhost:8000/search -H "content-type: application/json" -d "{\"query\": \"test\"}"'
